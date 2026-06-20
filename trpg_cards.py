@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import io
 from typing import Any
 
@@ -14,12 +15,26 @@ def build_card_html(template: str, *, sheet: dict, schema: dict, mugshot_uri: st
             continue
         val = sheet.get(f["key"], f.get("default"))
         if isinstance(val, list):
-            val = "、".join(str(x) for x in val) if val else "—"
-        rows.append(f"<tr><td class='k'>{f.get('label', f['key'])}</td><td>{val}</td></tr>")
-    html = template.replace("{{name}}", str(sheet.get("name", "")))
-    html = html.replace("{{mugshot}}", mugshot_uri or "")
-    html = html.replace("{{stats_rows}}", "".join(rows))
-    return html
+            val = "、".join(html.escape(str(x), quote=True) for x in val) if val else "—"
+        else:
+            val = html.escape(str(val), quote=True)
+        label = html.escape(str(f.get("label", f["key"])), quote=True)
+        rows.append(f"<tr><td class='k'>{label}</td><td>{val}</td></tr>")
+
+    # Escape name
+    name = html.escape(str(sheet.get("name", "")), quote=True)
+    result = template.replace("{{name}}", name)
+
+    # Validate and escape mugshot URI: allow only data: URLs (base64 images) or https:// URLs
+    safe_mugshot = ""
+    if mugshot_uri:
+        stripped_uri = mugshot_uri.strip()
+        if stripped_uri.lower().startswith("data:image/") or stripped_uri.lower().startswith("https://"):
+            safe_mugshot = html.escape(stripped_uri, quote=True)
+    result = result.replace("{{mugshot}}", safe_mugshot)
+
+    result = result.replace("{{stats_rows}}", "".join(rows))
+    return result
 
 
 def to_compact_webp(png_b64: str, logger: Any = None) -> str:

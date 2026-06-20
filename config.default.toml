@@ -2,3 +2,21 @@
 enabled = true
 config_version = "1.0.0"
 maibot_plays = true
+
+[gm]
+main_gm_prompt = "你是一位资深的跑团主持人（GM）。你负责描述场景、扮演 NPC、推进剧情，依据玩家行动给出生动、公正的叙事。你只负责叙事与裁定，绝不替玩家做决定，也绝不自行编造骰值——需要检定时用掷骰协议请求掷骰。语言：简体中文。"
+gm_model = "replyer"
+temperature = 0.8
+max_tokens = 4000
+timeout_seconds = 300
+
+[loop]
+inactivity_flush_seconds = 45
+ooc_marker = "/ooc"
+max_consecutive_auto = 2
+
+[context]
+char_budget = 120000
+
+[storage]
+data_dir = ""

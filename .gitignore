@@ -1,0 +1,5 @@
+config.local.toml
+data/
+__pycache__/
+.ruff_cache/
+*.pyc

@@ -152,6 +152,8 @@ class MaiTRPGPlugin(MaiBotPlugin):
 
     def _write_bible(self, stream_id: str, key_fname: str, text: str, *, append: bool) -> None:
         sid = self._active_session_id(stream_id)
+        if not sid:
+            raise ValueError("没有可写入的会话")
         f = self._paths(stream_id, sid).bible_file(key_fname)
         f.parent.mkdir(parents=True, exist_ok=True)
         if append and f.exists():
@@ -298,11 +300,17 @@ class MaiTRPGPlugin(MaiBotPlugin):
             trpg_storage.write_toml(path, trpg_schema.resolve_schema(None))
             return {"success": True, "content": "已重置为默认 schema。"}
         if mode == "custom":
-            parsed = json.loads(data) if data.strip() else {}
+            try:
+                parsed = json.loads(data) if data.strip() else {}
+            except (json.JSONDecodeError, ValueError):
+                return {"success": False, "content": "data 不是有效的 JSON。"}
             trpg_storage.write_toml(path, trpg_schema.resolve_schema(parsed))
             return {"success": True, "content": "已设置自定义 schema。"}
         if mode == "edit":
-            spec = json.loads(data) if data.strip() else {}
+            try:
+                spec = json.loads(data) if data.strip() else {}
+            except (json.JSONDecodeError, ValueError):
+                return {"success": False, "content": "data 不是有效的 JSON。"}
             new = trpg_schema.apply_edits(cur, add=spec.get("add", []), modify=spec.get("modify", []), remove=spec.get("remove", []))
             trpg_storage.write_toml(path, new)
             return {"success": True, "content": "已更新 schema：" + trpg_gm.schema_summary(new)}

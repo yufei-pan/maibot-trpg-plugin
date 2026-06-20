@@ -60,3 +60,15 @@ def test_bible_world_rejects_empty(tmp_path):
     inst = _plugin(tmp_path)
     r = asyncio.run(inst.bible_world(text="   ", stream_id="g1"))
     assert not r["success"]
+
+
+def test_sheet_schema_rejects_malformed_json(tmp_path):
+    inst = _plugin(tmp_path)
+    # Test mode="custom" with malformed JSON
+    r = asyncio.run(inst.sheet_schema(mode="custom", data="not valid json{", stream_id="g1"))
+    assert not r["success"]
+    assert "不是有效的 JSON" in r["content"]
+    # Test mode="edit" with malformed JSON
+    r = asyncio.run(inst.sheet_schema(mode="edit", data="not valid json{", stream_id="g1"))
+    assert not r["success"]
+    assert "不是有效的 JSON" in r["content"]

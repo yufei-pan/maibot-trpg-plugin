@@ -1,3 +1,5 @@
+import pytest
+
 from trpg_schema import (DEFAULT_SCHEMA, apply_edits, blank_sheet, resolve_schema,
                          sheet_complete, validate_sheet)
 
@@ -36,3 +38,15 @@ def test_validate_and_complete():
     assert sheet_complete(blank, s)
     blank["hp"] = "ten"  # wrong type
     assert not sheet_complete(blank, s)
+
+
+def test_apply_edits_modify_rejects_bad_type():
+    """Ensure apply_edits validates type in modify patches, rejecting invalid types."""
+    with pytest.raises(ValueError, match="修改字段 type 非法"):
+        apply_edits(resolve_schema(None), modify=[{"key": "hp", "type": "bogus"}])
+
+    # Valid modify with type change should work
+    s = apply_edits(resolve_schema(None), modify=[{"key": "hp", "type": "float", "default": 1.0}])
+    by_key = {f["key"]: f for f in s["fields"]}
+    assert by_key["hp"]["type"] == "float"
+    assert by_key["hp"]["default"] == 1.0

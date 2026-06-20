@@ -42,6 +42,8 @@ def apply_edits(schema: dict[str, Any], *, add: list[dict] = (), modify: list[di
     for patch in modify:
         key = patch.get("key")
         if key in by_key:
+            if "type" in patch and patch["type"] not in _PY_TYPES:
+                raise ValueError(f"修改字段 type 非法：{patch!r}")
             by_key[key].update({k: v for k, v in patch.items() if k != "key"})
     rm = set(remove)
     fields = [f for f in fields if f["key"] not in rm]

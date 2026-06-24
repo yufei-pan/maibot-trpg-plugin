@@ -132,3 +132,62 @@ def test_runaway_guard_blocks_maibot_only_batch(tmp_path):
     buf.add(__import__("trpg_batch").Entry("麦麦", "maibot", "我也撬"))
     asyncio.run(inst._flush_stream("g1"))
     assert inst.ctx.send.texts == []  # 无真人行动且已达上限 → 不推进
+
+
+# ------------------------------------------------------------------ #
+# on_after_send HookHandler 测试
+# ------------------------------------------------------------------ #
+def _fake_send_message(session_id: str, text: str) -> dict:
+    """构造与宿主 serialize_session_message 一致的 MessageDict。
+
+    关键字段：processed_plain_text（文本）、session_id（聊天流 ID）。
+    参考：MaiBot/src/plugin_runtime/host/message_utils.py:412-436
+    """
+    return {
+        "message_id": "test-msg-001",
+        "timestamp": "1719100000.0",
+        "platform": "test",
+        "message_info": {
+            "user_info": {"user_id": "bot", "user_nickname": "麦麦"},
+        },
+        "raw_message": [],
+        "is_mentioned": False,
+        "is_at": False,
+        "is_emoji": False,
+        "is_picture": False,
+        "is_command": False,
+        "is_notify": False,
+        "session_id": session_id,
+        "processed_plain_text": text,
+    }
+
+
+def test_after_send_buffers_maibot_action(tmp_path):
+    """sent=True + 非 GM 旁白 → 麦麦行动被收入 buffer。"""
+    inst = _running_plugin(tmp_path)
+    msg = _fake_send_message("g1", "我挥剑攻击")
+    asyncio.run(inst.on_after_send(message=msg, sent=True))
+    entries = list(inst._buffer_for("g1").entries)
+    assert len(entries) == 1
+    assert entries[0].kind == "maibot"
+    assert entries[0].text == "我挥剑攻击"
+
+
+def test_after_send_skips_own_gm_narration(tmp_path):
+    """text 与 _last_narration 匹配 → 不缓冲（防止 GM 旁白被当做玩家行动）。"""
+    inst = _running_plugin(tmp_path)
+    narration = "【GM】你踏入黑暗的走廊。"
+    inst._last_narration["g1"] = narration
+    msg = _fake_send_message("g1", narration)
+    asyncio.run(inst.on_after_send(message=msg, sent=True))
+    entries = list(inst._buffer_for("g1").entries)
+    assert len(entries) == 0
+
+
+def test_after_send_skips_when_not_sent(tmp_path):
+    """sent=False → 发送失败，不缓冲。"""
+    inst = _running_plugin(tmp_path)
+    msg = _fake_send_message("g1", "我挥剑")
+    asyncio.run(inst.on_after_send(message=msg, sent=False))
+    entries = list(inst._buffer_for("g1").entries)
+    assert len(entries) == 0

@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from maibot_sdk import Command, EventHandler, Field, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import EventType, ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import EventType, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 import asyncio
 import random
@@ -465,30 +465,47 @@ class MaiTRPGPlugin(MaiBotPlugin):
         self._arm_timer(stream_id)
         return None
 
-    @EventHandler("trpg_intake_mai", description="收集麦麦的扮演发言", event_type=EventType.AFTER_SEND)
-    async def on_after_send(self, message: Any = None, stream_id: str = "", **kwargs: Any) -> Any:
+    @HookHandler(
+        "send_service.after_send",
+        name="trpg_intake_mai",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.LATE,
+    )
+    async def on_after_send(self, message: Any = None, sent: bool = False, **kwargs: Any) -> None:
         """捕获 MaiBot 自身出站消息作为麦麦玩家行动。
-        防失控回环：比对 _last_narration，若匹配则是本插件刚发出的 GM 旁白，跳过。"""
-        if not message or not stream_id:
-            return None
-        text = message.get("plain_text", "") if isinstance(message, dict) else ""
-        if not text:
-            return None
-        # 防失控回环：刚发出的 GM 旁白不当做麦麦玩家行动
-        last = self._last_narration.get(stream_id, "")
-        if last and text.strip() == last.strip():
-            return None
-        sid = self._running_session(stream_id)
-        if not sid:
-            return None
-        meta = self._load_meta(stream_id, sid)
-        mai = self._maibot_member()
-        if not mai or mai not in meta["members"] or trpg_session.story_held(meta):
-            return None
-        if trpg_batch.is_ooc(text, self.config.loop.ooc_marker):
-            return None
-        self._buffer_for(stream_id).add(trpg_batch.Entry(mai, "maibot", text))
-        self._arm_timer(stream_id)
+
+        宿主在 send_service.py 发送完成后调用此 Hook，传入序列化后的
+        SessionMessage 字典（键 ``processed_plain_text`` / ``session_id``）
+        和 ``sent`` 布尔标志。
+
+        OBSERVE 模式不可中断发送管线，因此内部捕获所有异常并记录日志。
+        防失控回环：比对 _last_narration，若匹配则是本插件刚发出的 GM 旁白，跳过。
+        """
+        try:
+            if not sent or not isinstance(message, dict):
+                return None
+            # 从序列化 SessionMessage 字典中提取文本和聊天流 ID
+            text = message.get("processed_plain_text") or ""
+            stream_id = message.get("session_id") or ""
+            if not text or not stream_id:
+                return None
+            # 防失控回环：刚发出的 GM 旁白不当做麦麦玩家行动
+            last = self._last_narration.get(stream_id, "")
+            if last and text.strip() == last.strip():
+                return None
+            sid = self._running_session(stream_id)
+            if not sid:
+                return None
+            meta = self._load_meta(stream_id, sid)
+            mai = self._maibot_member()
+            if not mai or mai not in meta["members"] or trpg_session.story_held(meta):
+                return None
+            if trpg_batch.is_ooc(text, self.config.loop.ooc_marker):
+                return None
+            self._buffer_for(stream_id).add(trpg_batch.Entry(mai, "maibot", text))
+            self._arm_timer(stream_id)
+        except Exception as exc:
+            self.ctx.logger.warning(f"[TRPG] on_after_send 观察器异常: {exc}")
         return None
 
     @Command("trpg_flush_command", description="立即把当前台面交给 GM", pattern=r"^/gm\s+go\s*$")

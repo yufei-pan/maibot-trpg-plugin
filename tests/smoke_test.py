@@ -23,6 +23,17 @@ def test_manifest_parses_and_declares_id():
     assert "Yufei Pan" in json.dumps(data, ensure_ascii=False)  # robust to author being str or object
 
 
+def test_full_suite_runs():
+    import subprocess
+    import sys
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", str(ROOT / "tests"), "-q",
+         "-p", "no:cacheprovider", "-k", "not test_full_suite_runs"],
+        cwd=str(ROOT),
+    )
+    assert r.returncode == 0
+
+
 if __name__ == "__main__":
     test_create_plugin_returns_instance()
     test_manifest_parses_and_declares_id()

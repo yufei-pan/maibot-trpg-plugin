@@ -3,6 +3,7 @@
 import asyncio
 import types
 
+import trpg_batch
 import trpg_session
 
 
@@ -113,7 +114,7 @@ def test_flush_produces_narration_roll_and_world_state(tmp_path):
     再生成 → 叙事送达（markers 已剥离）→ audit_log → world_state 更新。"""
     inst = _running_plugin(tmp_path)
     buf = inst._buffer_for("g1")
-    buf.add(__import__("trpg_batch").Entry("u1", "human", "我撬锁"))
+    buf.add(trpg_batch.Entry("u1", "human", "我撬锁"))
     asyncio.run(inst._flush_stream("g1"))
     # 叙事已发送（markers 已剥离），掷骰注入过，world_state 已持久化
     joined = "\n".join(inst.ctx.send.texts)
@@ -129,7 +130,7 @@ def test_runaway_guard_blocks_maibot_only_batch(tmp_path):
     inst = _running_plugin(tmp_path)
     inst._consecutive_auto["g1"] = inst.config.loop.max_consecutive_auto
     buf = inst._buffer_for("g1")
-    buf.add(__import__("trpg_batch").Entry("麦麦", "maibot", "我也撬"))
+    buf.add(trpg_batch.Entry("麦麦", "maibot", "我也撬"))
     asyncio.run(inst._flush_stream("g1"))
     assert inst.ctx.send.texts == []  # 无真人行动且已达上限 → 不推进
 
@@ -189,5 +190,64 @@ def test_after_send_skips_when_not_sent(tmp_path):
     inst = _running_plugin(tmp_path)
     msg = _fake_send_message("g1", "我挥剑")
     asyncio.run(inst.on_after_send(message=msg, sent=False))
+    entries = list(inst._buffer_for("g1").entries)
+    assert len(entries) == 0
+
+
+# ------------------------------------------------------------------ #
+# on_message HookHandler 测试
+# ------------------------------------------------------------------ #
+def _fake_inbound_message(session_id: str, text: str, user_id: str) -> dict:
+    """构造与宿主 serialize_session_message 一致的入站 MessageDict。
+
+    关键字段：session_id（聊天流）、processed_plain_text（文本）、
+    message_info.user_info.user_id（发言者）。
+    参考：MaiBot/src/plugin_runtime/host/message_utils.py:412-436
+    """
+    return {
+        "message_id": "test-inbound-001",
+        "timestamp": "1719100000.0",
+        "platform": "test",
+        "message_info": {
+            "user_info": {"user_id": user_id, "user_nickname": user_id},
+        },
+        "raw_message": [],
+        "is_mentioned": False,
+        "is_at": False,
+        "is_emoji": False,
+        "is_picture": False,
+        "is_command": False,
+        "is_notify": False,
+        "session_id": session_id,
+        "processed_plain_text": text,
+    }
+
+
+def test_on_message_buffers_human_action(tmp_path):
+    """入站人类发言（会话成员）→ human Entry 被缓冲。"""
+    inst = _running_plugin(tmp_path)
+    msg = _fake_inbound_message("g1", "我打开宝箱", "u1")
+    asyncio.run(inst.on_message(message=msg))
+    entries = list(inst._buffer_for("g1").entries)
+    assert len(entries) == 1
+    assert entries[0].kind == "human"
+    assert entries[0].author == "u1"
+    assert "打开宝箱" in entries[0].text
+
+
+def test_on_message_skips_ooc(tmp_path):
+    """OOC 标记的发言不缓冲。"""
+    inst = _running_plugin(tmp_path)
+    msg = _fake_inbound_message("g1", "/ooc 我去吃饭了", "u1")
+    asyncio.run(inst.on_message(message=msg))
+    entries = list(inst._buffer_for("g1").entries)
+    assert len(entries) == 0
+
+
+def test_on_message_skips_non_member(tmp_path):
+    """非会话成员发言不缓冲。"""
+    inst = _running_plugin(tmp_path)
+    msg = _fake_inbound_message("g1", "我也想参加", "outsider")
+    asyncio.run(inst.on_message(message=msg))
     entries = list(inst._buffer_for("g1").entries)
     assert len(entries) == 0

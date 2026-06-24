@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from maibot_sdk import Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import EventType, HookMode, HookOrder, ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 import asyncio
 import random
@@ -442,27 +442,48 @@ class MaiTRPGPlugin(MaiBotPlugin):
         self._timers[stream_id] = loop.call_later(
             delay, lambda: asyncio.ensure_future(self._flush_stream(stream_id)))
 
-    @EventHandler("trpg_intake", description="收集台面发言", event_type=EventType.ON_MESSAGE)
-    async def on_message(self, message: Any = None, stream_id: str = "", **kwargs: Any) -> Any:
-        """缓冲入站人类发言；忽略 OOC、story_held、非会话成员。"""
-        if not message or not stream_id:
-            return None
-        sid = self._running_session(stream_id)
-        if not sid:
-            return None
-        meta = self._load_meta(stream_id, sid)
-        if trpg_session.story_held(meta):
-            return None
-        text = message.get("plain_text", "") if isinstance(message, dict) else ""
-        # 防御式取发言者 ID：SDK 未明确固定字段名，依次尝试
-        author = str(message.get("user_id") or message.get("sender_id") or "") if isinstance(message, dict) else ""
-        if not text or author not in meta["members"]:
-            return None
-        if trpg_batch.is_ooc(text, self.config.loop.ooc_marker):
-            return None
-        self._buffer_for(stream_id).add(
-            trpg_batch.Entry(author, "human", trpg_batch.clean_action(text, self.config.loop.ooc_marker)))
-        self._arm_timer(stream_id)
+    @HookHandler(
+        "chat.receive.after_process",
+        name="trpg_intake",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.LATE,
+    )
+    async def on_message(self, message: Any = None, **kwargs: Any) -> None:
+        """缓冲入站人类发言；忽略 OOC、story_held、非会话成员。
+
+        宿主在 bot.py:594 对入站消息完成 process() 后调用此 Hook，传入
+        serialize_session_message 产生的 MessageDict 字典。
+        关键字段：session_id（聊天流）、processed_plain_text（文本）、
+        message_info.user_info.user_id（发言者）。
+
+        OBSERVE 模式不可中断入站管线，因此内部捕获所有异常并记录日志。
+        """
+        try:
+            if not isinstance(message, dict):
+                return None
+            stream_id = message.get("session_id") or ""
+            text = message.get("processed_plain_text") or ""
+            if not stream_id or not text:
+                return None
+            sid = self._running_session(stream_id)
+            if not sid:
+                return None
+            meta = self._load_meta(stream_id, sid)
+            if trpg_session.story_held(meta):
+                return None
+            # 防御式取发言者 ID：从嵌套 message_info.user_info.user_id 提取
+            author = str(
+                ((message.get("message_info") or {}).get("user_info") or {}).get("user_id", "")
+            )
+            if not author or author not in meta["members"]:
+                return None
+            if trpg_batch.is_ooc(text, self.config.loop.ooc_marker):
+                return None
+            self._buffer_for(stream_id).add(
+                trpg_batch.Entry(author, "human", trpg_batch.clean_action(text, self.config.loop.ooc_marker)))
+            self._arm_timer(stream_id)
+        except Exception as exc:
+            self.ctx.logger.warning(f"[TRPG] on_message 观察器异常: {exc}")
         return None
 
     @HookHandler(
@@ -528,7 +549,8 @@ class MaiTRPGPlugin(MaiBotPlugin):
         )
         if isinstance(result, dict) and result.get("success"):
             return str(result.get("response", ""))
-        return str(result.get("response", "") if isinstance(result, dict) else "") or ""
+        # 生成失败：显式返回空字符串，由调用方记录警告（不兜底）
+        return ""
 
     async def _flush_stream(self, stream_id: str) -> None:
         """GM 回合管线：漏斗冲刷 → 装配上下文 → GM 生成 → 解析掷骰 →
@@ -596,6 +618,14 @@ class MaiTRPGPlugin(MaiBotPlugin):
                     world_state=world_state, recent_turns=batch,
                     batch=sys_entries, char_budget=self.config.context.char_budget)
                 gm_text = await self._run_gm(messages2, system_prompt)
+
+            # GM 生成失败：记录警告，批次已落盘（episode_log），不兜底
+            if not gm_text:
+                self.ctx.logger.warning(
+                    "[TRPG] GM 生成无输出，stream=%s session=%s，批次已记录但无叙事产出",
+                    stream_id, sid,
+                )
+                return
 
             # 提取并持久化 world_state
             new_ws = trpg_gm.extract_world_state(gm_text)

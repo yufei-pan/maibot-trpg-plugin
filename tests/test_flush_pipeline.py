@@ -1,0 +1,134 @@
+"""Task 12: 台面收集 → 去抖冲刷 → GM 回合全链路测试。"""
+
+import asyncio
+import types
+
+import trpg_session
+
+
+# ------------------------------------------------------------------ #
+# Fakes — 匹配 SDK 的真实 ctx.llm.generate 签名
+# ------------------------------------------------------------------ #
+class FakeLLM:
+    """模拟 ctx.llm.generate；第1次返回带 ROLL 标记，第2次返回叙事 + WORLD_STATE。
+
+    真实签名：generate(prompt, model="", temperature=None, max_tokens=None, **kwargs)
+    返回：{"success": True, "response": "...", "reasoning": "", "model": "..."}
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    async def generate(self, prompt=None, model="", temperature=None, max_tokens=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "success": True,
+                "response": (
+                    "你撬动锁芯。\n"
+                    "===ROLL===\n"
+                    "actor: u1\n"
+                    "modifier: 2\n"
+                    "dc: 10\n"
+                    "advantage: 0\n"
+                    "reason: 撬锁\n"
+                    "===END==="
+                ),
+                "reasoning": "",
+                "model": model or "test-model",
+            }
+        return {
+            "success": True,
+            "response": "锁应声而开，门后是幽深的走廊。\n===WORLD_STATE===\n队伍进入走廊。\n===END===",
+            "reasoning": "",
+            "model": model or "test-model",
+        }
+
+
+class FakeSend:
+    def __init__(self):
+        self.texts: list[str] = []
+
+    async def text(self, content, stream_id):
+        self.texts.append(content)
+
+    async def image(self, *a, **k):
+        pass
+
+
+class FakeMaisaka:
+    def __init__(self):
+        self.context = types.SimpleNamespace(append=self._noop)
+        self.proactive = types.SimpleNamespace(trigger=self._noop)
+
+    async def _noop(self, **k):
+        pass
+
+
+class FakeLogger:
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+    def error(self, *a, **k):
+        pass
+
+
+# ------------------------------------------------------------------ #
+# 辅助：构建一个已 running 的插件实例
+# ------------------------------------------------------------------ #
+def _running_plugin(tmp_path):
+    import plugin
+
+    inst = plugin.create_plugin()
+    inst._ctx = types.SimpleNamespace(
+        send=FakeSend(), llm=FakeLLM(), maisaka=FakeMaisaka(), logger=FakeLogger()
+    )
+    cfg = plugin.MaiTRPGConfig()
+    cfg.storage.data_dir = str(tmp_path)
+    inst._plugin_config_instance = cfg
+
+    asyncio.run(inst.session_create(title="局", stream_id="g1"))
+    # 补全 bible
+    for fn, t in (("world.md", "高塔"), ("plot.md", "圣杯"), ("gm_subprompt.md", "严肃")):
+        inst._write_bible("g1", fn, t, append=False)
+    # 加入人类玩家 u1 并补全角色卡
+    meta = trpg_session.add_member(inst._load_meta("g1", "局"), "u1")
+    inst._save_meta("g1", "局", meta)
+    asyncio.run(inst.sheet_edit(fields={"name": "阿强"}, member="u1", stream_id="g1"))
+    # 麦麦自动加入，同样需要完成角色卡
+    asyncio.run(inst.sheet_edit(fields={"name": "麦麦"}, member="麦麦", stream_id="g1"))
+    # 开始会话
+    asyncio.run(inst.session_start(stream_id="g1"))
+    return inst
+
+
+# ------------------------------------------------------------------ #
+# 测试
+# ------------------------------------------------------------------ #
+def test_flush_produces_narration_roll_and_world_state(tmp_path):
+    """完整 GM 回合：人类行动 → buffer → flush → ROLL 请求 → 掷骰注入 →
+    再生成 → 叙事送达（markers 已剥离）→ audit_log → world_state 更新。"""
+    inst = _running_plugin(tmp_path)
+    buf = inst._buffer_for("g1")
+    buf.add(__import__("trpg_batch").Entry("u1", "human", "我撬锁"))
+    asyncio.run(inst._flush_stream("g1"))
+    # 叙事已发送（markers 已剥离），掷骰注入过，world_state 已持久化
+    joined = "\n".join(inst.ctx.send.texts)
+    assert "锁应声而开" in joined
+    assert "===ROLL===" not in joined
+    audit = inst._paths("g1", "局").audit_log.read_text(encoding="utf-8")
+    assert "u1" in audit and "DC10" in audit
+    assert "走廊" in inst._paths("g1", "局").world_state.read_text(encoding="utf-8")
+
+
+def test_runaway_guard_blocks_maibot_only_batch(tmp_path):
+    """防失控守卫：连续自动推进达上限 + 缓冲仅含 maibot 行动 → 不推进。"""
+    inst = _running_plugin(tmp_path)
+    inst._consecutive_auto["g1"] = inst.config.loop.max_consecutive_auto
+    buf = inst._buffer_for("g1")
+    buf.add(__import__("trpg_batch").Entry("麦麦", "maibot", "我也撬"))
+    asyncio.run(inst._flush_stream("g1"))
+    assert inst.ctx.send.texts == []  # 无真人行动且已达上限 → 不推进

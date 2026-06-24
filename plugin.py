@@ -5,11 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, EventHandler, Field, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import EventType, ToolParameterInfo, ToolParamType
 
 import asyncio
+import random
+import trpg_batch
 import trpg_cards
+import trpg_context
+import trpg_dice
 import trpg_gm
 import trpg_schema
 import trpg_session
@@ -83,6 +87,7 @@ class MaiTRPGPlugin(MaiBotPlugin):
         self._buffers: dict[str, Any] = {}            # stream_id -> trpg_batch.BatchBuffer
         self._consecutive_auto: dict[str, int] = {}
         self._flush_locks: dict[str, asyncio.Lock] = {}
+        self._last_narration: dict[str, str] = {}     # stream_id -> 上次发出的 GM 旁白（防失控回环）
 
     def _data_root(self) -> Path:
         custom = (self.config.storage.data_dir or "").strip()
@@ -412,6 +417,195 @@ class MaiTRPGPlugin(MaiBotPlugin):
         self._save_meta(stream_id, sid, meta)
         await self.ctx.send.text(f"{member} 已加入会话，请用 /sheet 完成你的角色卡后才能开始/继续。", stream_id)
         return None
+
+    # ------------------------------------------------------------------ #
+    # 台面收集与 GM 回合循环
+    # ------------------------------------------------------------------ #
+    def _buffer_for(self, stream_id: str) -> trpg_batch.BatchBuffer:
+        if stream_id not in self._buffers:
+            self._buffers[stream_id] = trpg_batch.BatchBuffer()
+        return self._buffers[stream_id]
+
+    def _running_session(self, stream_id: str) -> str | None:
+        """返回该聊天流中正在进行的会话 ID；没有则返回 None。"""
+        for s in trpg_storage.list_sessions(self._data_root(), stream_id):
+            if s["status"] == trpg_session.RUNNING:
+                return s["session_id"]
+        return None
+
+    def _arm_timer(self, stream_id: str) -> None:
+        """重置台面去抖定时器：静默一段时间后自动冲刷。"""
+        loop = asyncio.get_event_loop()
+        if stream_id in self._timers:
+            self._timers[stream_id].cancel()
+        delay = max(5, int(self.config.loop.inactivity_flush_seconds))
+        self._timers[stream_id] = loop.call_later(
+            delay, lambda: asyncio.ensure_future(self._flush_stream(stream_id)))
+
+    @EventHandler("trpg_intake", description="收集台面发言", event_type=EventType.ON_MESSAGE)
+    async def on_message(self, message: Any = None, stream_id: str = "", **kwargs: Any) -> Any:
+        """缓冲入站人类发言；忽略 OOC、story_held、非会话成员。"""
+        if not message or not stream_id:
+            return None
+        sid = self._running_session(stream_id)
+        if not sid:
+            return None
+        meta = self._load_meta(stream_id, sid)
+        if trpg_session.story_held(meta):
+            return None
+        text = message.get("plain_text", "") if isinstance(message, dict) else ""
+        # 防御式取发言者 ID：SDK 未明确固定字段名，依次尝试
+        author = str(message.get("user_id") or message.get("sender_id") or "") if isinstance(message, dict) else ""
+        if not text or author not in meta["members"]:
+            return None
+        if trpg_batch.is_ooc(text, self.config.loop.ooc_marker):
+            return None
+        self._buffer_for(stream_id).add(
+            trpg_batch.Entry(author, "human", trpg_batch.clean_action(text, self.config.loop.ooc_marker)))
+        self._arm_timer(stream_id)
+        return None
+
+    @EventHandler("trpg_intake_mai", description="收集麦麦的扮演发言", event_type=EventType.AFTER_SEND)
+    async def on_after_send(self, message: Any = None, stream_id: str = "", **kwargs: Any) -> Any:
+        """捕获 MaiBot 自身出站消息作为麦麦玩家行动。
+        防失控回环：比对 _last_narration，若匹配则是本插件刚发出的 GM 旁白，跳过。"""
+        if not message or not stream_id:
+            return None
+        text = message.get("plain_text", "") if isinstance(message, dict) else ""
+        if not text:
+            return None
+        # 防失控回环：刚发出的 GM 旁白不当做麦麦玩家行动
+        last = self._last_narration.get(stream_id, "")
+        if last and text.strip() == last.strip():
+            return None
+        sid = self._running_session(stream_id)
+        if not sid:
+            return None
+        meta = self._load_meta(stream_id, sid)
+        mai = self._maibot_member()
+        if not mai or mai not in meta["members"] or trpg_session.story_held(meta):
+            return None
+        if trpg_batch.is_ooc(text, self.config.loop.ooc_marker):
+            return None
+        self._buffer_for(stream_id).add(trpg_batch.Entry(mai, "maibot", text))
+        self._arm_timer(stream_id)
+        return None
+
+    @Command("trpg_flush_command", description="立即把当前台面交给 GM", pattern=r"^/gm\s+go\s*$")
+    async def cmd_flush(self, **kwargs: Any) -> Any:
+        stream_id = self._resolve_stream_id(kwargs)
+        await self._flush_stream(stream_id)
+        return None
+
+    async def _run_gm(self, messages: list[dict], system_prompt: str) -> str:
+        """单次 GM 生成调用（封装 ctx.llm.generate 的真实签名）。
+
+        真实签名：generate(prompt, model, temperature, max_tokens)
+        返回：{"success": bool, "response": str, ...}
+        """
+        result = await self.ctx.llm.generate(
+            prompt=messages,
+            model=self.config.gm.gm_model,
+            temperature=self.config.gm.temperature,
+            max_tokens=self.config.gm.max_tokens if self.config.gm.max_tokens > 0 else None,
+        )
+        if isinstance(result, dict) and result.get("success"):
+            return str(result.get("response", ""))
+        return str(result.get("response", "") if isinstance(result, dict) else "") or ""
+
+    async def _flush_stream(self, stream_id: str) -> None:
+        """GM 回合管线：漏斗冲刷 → 装配上下文 → GM 生成 → 解析掷骰 →
+        权威掷骰 → 注入系统结果 → 再生成 → 剥离标记 → 发送叙事 →
+        写入剧集日志/审计/world_state → 唤醒麦麦。"""
+        # 取消定时器
+        if stream_id in self._timers:
+            self._timers.pop(stream_id).cancel()
+        sid = self._running_session(stream_id)
+        if not sid:
+            return
+        # 幂等锁：同一 stream 不重入
+        lock = self._flush_locks.setdefault(stream_id, asyncio.Lock())
+        if lock.locked():
+            return
+        async with lock:
+            buffer = self._buffer_for(stream_id)
+            decision = trpg_batch.decide_advance(
+                buffer, self._consecutive_auto.get(stream_id, 0),
+                self.config.loop.max_consecutive_auto)
+            if not decision.advance:
+                return
+            batch = buffer.drain()
+            # 更新连续自动推进计数器
+            self._consecutive_auto[stream_id] = (
+                0 if any(e.kind == "human" for e in batch)
+                else self._consecutive_auto.get(stream_id, 0) + 1
+            )
+
+            p = self._paths(stream_id, sid)
+            schema = self._load_schema(stream_id, sid)
+            bible = {
+                k: (p.bible_file(f"{k}.md").read_text(encoding="utf-8")
+                     if p.bible_file(f"{k}.md").exists() else "")
+                for k in ("world", "plot")
+            }
+            gm_sub = (p.bible_file("gm_subprompt.md").read_text(encoding="utf-8")
+                       if p.bible_file("gm_subprompt.md").exists() else "")
+            world_state = (p.world_state.read_text(encoding="utf-8")
+                           if p.world_state.exists()
+                           else trpg_context.bible_block(bible))
+
+            system_prompt = trpg_gm.build_system_prompt(
+                self.config.gm.main_gm_prompt, gm_sub, trpg_gm.schema_summary(schema))
+            messages = trpg_context.assemble_messages(
+                world_state=world_state, recent_turns=[], batch=batch,
+                char_budget=self.config.context.char_budget)
+            # 写入剧集日志（批次行动）
+            for e in batch:
+                trpg_storage.append_line(p.episode_log(0), f"{e.author}（{e.kind}）：{e.text}")
+
+            gm_text = await self._run_gm(messages, system_prompt)
+
+            # 解析掷骰请求 → 权威掷骰 → 注入系统结果 → 再次生成
+            requests = trpg_gm.parse_roll_requests(gm_text)
+            if requests:
+                rng = random.Random()
+                sys_entries: list[trpg_batch.Entry] = []
+                for req in requests:
+                    res = trpg_dice.check(req.modifier, req.dc, rng=rng, advantage=req.advantage)
+                    line = trpg_gm.format_roll_result(req, res)
+                    trpg_storage.append_line(p.audit_log, line)
+                    sys_entries.append(trpg_batch.Entry("系统", "system", line))
+                messages2 = trpg_context.assemble_messages(
+                    world_state=world_state, recent_turns=batch,
+                    batch=sys_entries, char_budget=self.config.context.char_budget)
+                gm_text = await self._run_gm(messages2, system_prompt)
+
+            # 提取并持久化 world_state
+            new_ws = trpg_gm.extract_world_state(gm_text)
+            if new_ws:
+                p.world_state.parent.mkdir(parents=True, exist_ok=True)
+                p.world_state.write_text(new_ws + "\n", encoding="utf-8")
+
+            # 剥离标记后发送叙事
+            narration = trpg_gm.strip_markers(gm_text)
+            if narration:
+                trpg_storage.append_line(p.episode_log(0), f"GM：{narration}")
+                # 记住本次旁白以防 on_after_send 回环
+                self._last_narration[stream_id] = f"【GM】{narration}"
+                await self.ctx.send.text(f"【GM】{narration}", stream_id)
+                # 唤醒麦麦以玩家身份回应
+                if self._maibot_member():
+                    try:
+                        await self.ctx.maisaka.context.append(
+                            stream_id=stream_id,
+                            segments=[{"type": "text", "content": f"[跑团|GM旁白] {narration}"}],
+                            source_kind="plugin:maibot-trpg")
+                        await self.ctx.maisaka.proactive.trigger(
+                            stream_id=stream_id,
+                            intent="trpg_player_turn",
+                            reason="GM 推进了剧情，轮到你作为玩家行动")
+                    except Exception as exc:  # noqa: BLE001
+                        self.ctx.logger.warning("麦麦跑团：唤醒麦麦失败：%s", exc)
 
     # ------------------------------------------------------------------ #
     # 生命周期

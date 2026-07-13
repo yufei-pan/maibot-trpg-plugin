@@ -15,13 +15,16 @@ class FakeLLM:
 
     真实签名：generate(prompt, model="", temperature=None, max_tokens=None, **kwargs)
     返回：{"success": True, "response": "...", "reasoning": "", "model": "..."}
+    prompts 列表记录每次调用收到的 prompt 参数（用于系统提示词回归断言）。
     """
 
     def __init__(self):
         self.calls = 0
+        self.prompts: list = []
 
     async def generate(self, prompt=None, model="", temperature=None, max_tokens=None, **kwargs):
         self.calls += 1
+        self.prompts.append(prompt)
         if self.calls == 1:
             return {
                 "success": True,
@@ -251,3 +254,45 @@ def test_on_message_skips_non_member(tmp_path):
     asyncio.run(inst.on_message(message=msg))
     entries = list(inst._buffer_for("g1").entries)
     assert len(entries) == 0
+
+
+# ------------------------------------------------------------------ #
+# 系统提示词回归 & story_held 守卫测试
+# ------------------------------------------------------------------ #
+def test_system_prompt_reaches_llm(tmp_path):
+    """回归：_run_gm 必须把系统提示词作为第一条 role=system 消息传给 LLM。
+
+    build_system_prompt 会把 GM 协议（含 ===ROLL===）嵌入系统提示词；
+    断言第一次调用的 prompt[0] 是 system 消息且内容非空且含 ROLL 协议标记。
+    """
+    inst = _running_plugin(tmp_path)
+    buf = inst._buffer_for("g1")
+    buf.add(trpg_batch.Entry("u1", "human", "我撬锁"))
+    asyncio.run(inst._flush_stream("g1"))
+    llm: FakeLLM = inst.ctx.llm
+    assert llm.prompts, "LLM 从未被调用"
+    first_prompt = llm.prompts[0]
+    assert isinstance(first_prompt, list) and len(first_prompt) >= 1, "prompt 必须为非空列表"
+    sys_msg = first_prompt[0]
+    assert sys_msg["role"] == "system", f"第一条消息 role 应为 system，实际为 {sys_msg['role']!r}"
+    assert sys_msg["content"], "系统提示词内容不能为空"
+    assert "===ROLL===" in sys_msg["content"], "系统提示词应包含掷骰协议标记 ===ROLL==="
+
+
+def test_story_held_blocks_flush(tmp_path):
+    """story_held 为 True 时 _flush_stream 不产生叙事，buffer 不被消耗。"""
+    inst = _running_plugin(tmp_path)
+    buf = inst._buffer_for("g1")
+    buf.add(trpg_batch.Entry("u1", "human", "我撬锁"))
+
+    # 让 story_held 返回 True：add_member 会把 newcomer 加入 pending_cards
+    meta = trpg_session.add_member(inst._load_meta("g1", "局"), "newcomer")
+    inst._save_meta("g1", "局", meta)
+
+    assert trpg_session.story_held(inst._load_meta("g1", "局")), "前提：story_held 应为 True"
+
+    asyncio.run(inst._flush_stream("g1"))
+
+    assert inst.ctx.send.texts == [], "story_held 时不应发送任何消息"
+    # buffer 未被消耗（drain 未被调用）
+    assert len(list(buf.entries)) == 1, "story_held 时 buffer 应保持未消耗"

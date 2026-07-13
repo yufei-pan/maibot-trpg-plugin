@@ -201,6 +201,8 @@ class MaiTRPGPlugin(MaiBotPlugin):
           parameters=[])
     async def session_list(self, **kwargs: Any) -> dict[str, Any]:
         stream_id = self._resolve_stream_id(kwargs)
+        if not stream_id:
+            return {"success": False, "content": "无法确定当前聊天流。"}
         sessions = trpg_storage.list_sessions(self._data_root(), stream_id)
         if not sessions:
             return {"success": True, "content": "本聊天还没有任何跑团会话。"}
@@ -212,6 +214,8 @@ class MaiTRPGPlugin(MaiBotPlugin):
           parameters=[ToolParameterInfo(name="session", param_type=ToolParamType.STRING, required=False, default="", description="会话ID，省略＝当前会话")])
     async def session_start(self, session: str = "", **kwargs: Any) -> dict[str, Any]:
         stream_id = self._resolve_stream_id(kwargs)
+        if not stream_id:
+            return {"success": False, "content": "无法确定当前聊天流。"}
         sid = self._active_session_id(stream_id, str(session).strip() or None)
         if not sid:
             return {"success": False, "content": "找不到会话，请先 session_create。"}
@@ -221,6 +225,7 @@ class MaiTRPGPlugin(MaiBotPlugin):
         meta = self._load_meta(stream_id, sid)
         meta["status"] = trpg_session.RUNNING
         self._save_meta(stream_id, sid, meta)
+        self._consecutive_auto[stream_id] = 0
         return {"success": True, "content": f"会话《{meta['title']}》已开始！台面就绪，开始你们的冒险吧。"}
 
     @Tool("session_stop",
@@ -228,6 +233,8 @@ class MaiTRPGPlugin(MaiBotPlugin):
           parameters=[ToolParameterInfo(name="session", param_type=ToolParamType.STRING, required=False, default="", description="会话ID，省略＝当前会话")])
     async def session_stop(self, session: str = "", **kwargs: Any) -> dict[str, Any]:
         stream_id = self._resolve_stream_id(kwargs)
+        if not stream_id:
+            return {"success": False, "content": "无法确定当前聊天流。"}
         sid = self._active_session_id(stream_id, str(session).strip() or None)
         if not sid:
             return {"success": False, "content": "找不到会话。"}
@@ -305,8 +312,10 @@ class MaiTRPGPlugin(MaiBotPlugin):
             trpg_storage.write_toml(path, trpg_schema.resolve_schema(None))
             return {"success": True, "content": "已重置为默认 schema。"}
         if mode == "custom":
+            if not data.strip():
+                return {"success": False, "content": "custom 模式需要提供 fields 的 JSON。"}
             try:
-                parsed = json.loads(data) if data.strip() else {}
+                parsed = json.loads(data)
             except (json.JSONDecodeError, ValueError):
                 return {"success": False, "content": "data 不是有效的 JSON。"}
             trpg_storage.write_toml(path, trpg_schema.resolve_schema(parsed))
@@ -377,6 +386,8 @@ class MaiTRPGPlugin(MaiBotPlugin):
             return {"success": False, "content": "缺少会话或玩家身份。"}
         if not image:
             return {"success": False, "content": "未提供图片。"}
+        if len(image) > 2_000_000:
+            return {"success": False, "content": "头像图片过大（请压缩后重试）。"}
         uri = image if image.startswith("data:") else f"data:image/png;base64,{image}"
         self._paths(stream_id, sid).character_toml(member).parent.mkdir(parents=True, exist_ok=True)
         (self._paths(stream_id, sid).characters_dir / f"{trpg_storage.safe_component(member)}.mugshot").write_text(uri, encoding="utf-8")
@@ -435,7 +446,7 @@ class MaiTRPGPlugin(MaiBotPlugin):
 
     def _arm_timer(self, stream_id: str) -> None:
         """重置台面去抖定时器：静默一段时间后自动冲刷。"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if stream_id in self._timers:
             self._timers[stream_id].cancel()
         delay = max(5, int(self.config.loop.inactivity_flush_seconds))
@@ -532,20 +543,26 @@ class MaiTRPGPlugin(MaiBotPlugin):
     @Command("trpg_flush_command", description="立即把当前台面交给 GM", pattern=r"^/gm\s+go\s*$")
     async def cmd_flush(self, **kwargs: Any) -> Any:
         stream_id = self._resolve_stream_id(kwargs)
+        if not self._running_session(stream_id):
+            await self.ctx.send.text("当前没有进行中的跑团会话。", stream_id)
+            return None
         await self._flush_stream(stream_id)
         return None
 
     async def _run_gm(self, messages: list[dict], system_prompt: str) -> str:
         """单次 GM 生成调用（封装 ctx.llm.generate 的真实签名）。
 
-        真实签名：generate(prompt, model, temperature, max_tokens)
+        真实签名：generate(prompt, model, temperature, max_tokens, timeout_ms=...)
+        系统提示词作为 messages 列表的第一个 {"role": "system", ...} 元素传入。
         返回：{"success": bool, "response": str, ...}
         """
+        full_messages = [{"role": "system", "content": system_prompt}, *messages]
         result = await self.ctx.llm.generate(
-            prompt=messages,
+            prompt=full_messages,
             model=self.config.gm.gm_model,
             temperature=self.config.gm.temperature,
             max_tokens=self.config.gm.max_tokens if self.config.gm.max_tokens > 0 else None,
+            timeout_ms=int(self.config.gm.timeout_seconds * 1000) if self.config.gm.timeout_seconds and self.config.gm.timeout_seconds > 0 else None,
         )
         if isinstance(result, dict) and result.get("success"):
             return str(result.get("response", ""))
@@ -561,6 +578,9 @@ class MaiTRPGPlugin(MaiBotPlugin):
             self._timers.pop(stream_id).cancel()
         sid = self._running_session(stream_id)
         if not sid:
+            return
+        # 新玩家角色卡待审：暂停叙事直到卡片补全
+        if trpg_session.story_held(self._load_meta(stream_id, sid)):
             return
         # 幂等锁：同一 stream 不重入
         lock = self._flush_locks.setdefault(stream_id, asyncio.Lock())
@@ -595,6 +615,7 @@ class MaiTRPGPlugin(MaiBotPlugin):
 
             system_prompt = trpg_gm.build_system_prompt(
                 self.config.gm.main_gm_prompt, gm_sub, trpg_gm.schema_summary(schema))
+            # recent_turns=[] — 历史回合从剧集日志加载留待 Phase 2，当前由 world_state 承载状态
             messages = trpg_context.assemble_messages(
                 world_state=world_state, recent_turns=[], batch=batch,
                 char_budget=self.config.context.char_budget)

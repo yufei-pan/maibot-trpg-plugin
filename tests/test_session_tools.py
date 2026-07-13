@@ -43,3 +43,12 @@ def test_session_create_rejects_empty_title(tmp_path):
     inst = _plugin(tmp_path)
     r = asyncio.run(inst.session_create(title="  ", stream_id="g1"))
     assert not r["success"]  # no silent success on empty input
+
+
+def test_session_list_rejects_empty_stream_id(tmp_path):
+    """session_list（以及 session_start/stop）在 stream_id 无法解析时应返回失败，而非作用于幽灵路径。"""
+    inst = _plugin(tmp_path)
+    # 不传任何 stream_id 相关键 → _resolve_stream_id 返回 ""
+    r = asyncio.run(inst.session_list())
+    assert not r["success"]
+    assert "聊天流" in r["content"]

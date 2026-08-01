@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,55 @@ import trpg_session
 import trpg_storage
 
 CURRENT_CONFIG_VERSION = "1.0.0"
+
+SHIPPED_CONFIG_TEMPLATE_NAME = "config.default.toml"
+
+
+def _is_runner_generated_bare_config(config_path: Path) -> bool:
+    """判断 ``config.toml`` 是否为 Runner/WebUI 重置后生成的无注释空壳。"""
+    if not config_path.exists():
+        return True
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        raw = tomllib.loads(text)
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    if any(line.lstrip().startswith("#") for line in text.splitlines()):
+        return False
+    section = raw.get("gm")
+    return not isinstance(section, dict) or not section
+
+
+def _restore_shipped_config_template(plugin_dir: Path) -> bool:
+    """用插件自带的 ``config.default.toml`` 覆盖 Runner 生成的空壳配置。"""
+    config_path = plugin_dir / "config.toml"
+    template_path = plugin_dir / SHIPPED_CONFIG_TEMPLATE_NAME
+    if not template_path.exists() or not _is_runner_generated_bare_config(config_path):
+        return False
+    shutil.copy2(template_path, config_path)
+    return True
+
+
+def _ensure_shipped_config_present(plugin_dir: Path) -> bool:
+    """若缺少运行期 ``config.toml``，从 ``config.default.toml`` 复制一份。"""
+    config_path = plugin_dir / "config.toml"
+    template_path = plugin_dir / SHIPPED_CONFIG_TEMPLATE_NAME
+    if config_path.exists() or not template_path.exists():
+        return False
+    shutil.copy2(template_path, config_path)
+    return True
+
+
+def _load_config_dict_from_disk(plugin_dir: Path) -> dict[str, Any] | None:
+    config_path = plugin_dir / "config.toml"
+    if not config_path.exists():
+        return None
+    try:
+        loaded = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
 
 
 class PluginSection(PluginConfigBase):
@@ -679,6 +730,10 @@ class MaiTRPGPlugin(MaiBotPlugin):
     # 生命周期
     # ------------------------------------------------------------------ #
     async def on_load(self) -> None:
+        if _restore_shipped_config_template(self._plugin_dir):
+            restored = _load_config_dict_from_disk(self._plugin_dir)
+            if restored is not None:
+                self.set_plugin_config(restored)
         self.ctx.logger.info("麦麦跑团插件已加载")
 
     async def on_unload(self) -> None:
@@ -690,4 +745,5 @@ class MaiTRPGPlugin(MaiBotPlugin):
 
 
 def create_plugin() -> MaiTRPGPlugin:
+    _ensure_shipped_config_present(Path(__file__).resolve().parent)
     return MaiTRPGPlugin()

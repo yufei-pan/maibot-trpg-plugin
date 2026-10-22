@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "com.0-hz.maitrpg",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "name": "麦麦跑团 (MaiTRPG)",
   "description": "让麦麦在群聊里主持并参与一场跑团（TRPG）：内部引擎做规则裁判（骰子/属性/就绪门禁/批处理回合），独立 GM 智能体负责叙事，麦麦作为普通玩家参与。每个聊天流一个会话目录（session.toml + bible/ + characters/ + world_state.md + 追加日志）。",
   "author": {

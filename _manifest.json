@@ -21,7 +21,7 @@
   },
   "sdk": {
     "min_version": "2.5.1",
-    "max_version": "2.14.99"
+    "max_version": "2.16.99"
   },
   "dependencies": [
     {
@@ -45,7 +45,6 @@
     "send.text",
     "send.image",
     "render.html2png",
-    "maisaka.context.append",
     "maisaka.proactive.trigger"
   ],
   "i18n": {

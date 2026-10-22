@@ -711,14 +711,14 @@ class MaiTRPGPlugin(MaiBotPlugin):
                 trpg_storage.append_line(p.episode_log(0), f"GM：{narration}")
                 # 记住本次旁白以防 on_after_send 回环
                 self._last_narration[stream_id] = f"【GM】{narration}"
-                await self.ctx.send.text(f"【GM】{narration}", stream_id)
+                # 同步进麦麦的聊天历史：宿主 1.3.12 起 context.append 只进规划器，
+                # 回复器只看真实聊天消息，旁白必须作为真实消息入历史才能被扮演玩家的回复看到
+                await self.ctx.send.text(
+                    f"【GM】{narration}", stream_id,
+                    sync_to_maisaka_history=True, maisaka_source_kind="plugin:maibot-trpg")
                 # 唤醒麦麦以玩家身份回应
                 if self._maibot_member():
                     try:
-                        await self.ctx.maisaka.context.append(
-                            stream_id=stream_id,
-                            segments=[{"type": "text", "content": f"[跑团|GM旁白] {narration}"}],
-                            source_kind="plugin:maibot-trpg")
                         await self.ctx.maisaka.proactive.trigger(
                             stream_id=stream_id,
                             intent="trpg_player_turn",

@@ -68,7 +68,7 @@
 
 ### GM 叙事与发送
 
-GM 旁白以 `【GM】` 前缀直接发送到聊天（`ctx.send.text`）。发送后通过 `ctx.maisaka.context.append` 和 `ctx.maisaka.proactive.trigger` 唤醒麦麦以玩家身份回应。
+GM 旁白以 `【GM】` 前缀直接发送到聊天（`ctx.send.text`，带 `sync_to_maisaka_history=True`），同步进麦麦的聊天历史，规划器和回复器都能看到。发送后通过 `ctx.maisaka.proactive.trigger` 唤醒麦麦以玩家身份回应。（宿主 1.3.12 起 `ctx.maisaka.context.append` 注入的内容只进规划器、回复器看不到，所以旁白不再走它。）
 
 ### 掷骰协议
 

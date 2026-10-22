@@ -52,9 +52,11 @@ class FakeLLM:
 class FakeSend:
     def __init__(self):
         self.texts: list[str] = []
+        self.text_kwargs: list[dict] = []
 
-    async def text(self, content, stream_id):
+    async def text(self, content, stream_id, **kwargs):
         self.texts.append(content)
+        self.text_kwargs.append(kwargs)
 
     async def image(self, *a, **k):
         pass
@@ -62,11 +64,16 @@ class FakeSend:
 
 class FakeMaisaka:
     def __init__(self):
-        self.context = types.SimpleNamespace(append=self._noop)
-        self.proactive = types.SimpleNamespace(trigger=self._noop)
+        self.appends: list[dict] = []
+        self.triggers: list[dict] = []
+        self.context = types.SimpleNamespace(append=self._append)
+        self.proactive = types.SimpleNamespace(trigger=self._trigger)
 
-    async def _noop(self, **k):
-        pass
+    async def _append(self, **k):
+        self.appends.append(k)
+
+    async def _trigger(self, **k):
+        self.triggers.append(k)
 
 
 class FakeLogger:
@@ -126,6 +133,23 @@ def test_flush_produces_narration_roll_and_world_state(tmp_path):
     audit = inst._paths("g1", "局").audit_log.read_text(encoding="utf-8")
     assert "u1" in audit and "DC10" in audit
     assert "走廊" in inst._paths("g1", "局").world_state.read_text(encoding="utf-8")
+
+
+def test_narration_synced_to_history_and_wakes_maibot(tmp_path):
+    """宿主 1.3.12 起回复器只看真实聊天消息：GM 旁白须同步进麦麦历史，
+    不再走只进规划器的 context.append，但仍要唤醒麦麦以玩家身份行动。"""
+    inst = _running_plugin(tmp_path)
+    buf = inst._buffer_for("g1")
+    buf.add(trpg_batch.Entry("u1", "human", "我撬锁"))
+    asyncio.run(inst._flush_stream("g1"))
+    send = inst.ctx.send
+    idx = next(i for i, t in enumerate(send.texts) if t.startswith("【GM】") and "锁应声而开" in t)
+    assert send.text_kwargs[idx] == {
+        "sync_to_maisaka_history": True,
+        "maisaka_source_kind": "plugin:maibot-trpg",
+    }
+    assert inst.ctx.maisaka.appends == []
+    assert [t["intent"] for t in inst.ctx.maisaka.triggers] == ["trpg_player_turn"]
 
 
 def test_runaway_guard_blocks_maibot_only_batch(tmp_path):
